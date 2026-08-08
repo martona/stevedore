@@ -358,6 +358,11 @@ Type=oneshot
 User=$u
 ExecStart=$STEVE_BIN run
 TimeoutStartSec=infinity
+# Shutdown mid-run: TERM triggers fleetrun's full teardown (stop units,
+# remove run dirs, stop EC2) over ssh to every participant; the 90s
+# default can cut that short when hosts are slow or unreachable
+# (ConnectTimeout=10 each, serial). Give it room before SIGKILL.
+TimeoutStopSec=300
 # 75 = estate lock busy: a manual run is in progress and this tick
 # politely yields -- that is scheduling, not failure
 SuccessExitStatus=75
