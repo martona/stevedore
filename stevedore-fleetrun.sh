@@ -574,6 +574,12 @@ gen_run_conf() {   # $1 = host identity -> writes $rundir/bundle-$1/run.conf
                     fi
                 fi
             done
+            # [exclusions] rows for this source (fleet.conf, parse-checked):
+            # sendtree drops these subtrees from plan AND manifest
+            if [[ -n "${fleet_excl_src[$id]:-}" ]]; then
+                printf '[exclusions]\n'
+                printf '%s\n' ${fleet_excl_src[$id]}
+            fi
         fi
         # No [sends] since T: the orchestrator drives sendtree per job row
         # (PROTOCOL.md §19); this conf carries host-scoped settings only.

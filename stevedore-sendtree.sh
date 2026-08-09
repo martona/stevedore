@@ -301,12 +301,34 @@ declare -A lpairs                    # dataset -> "snap:guid,..." same order (2.
 declare -A bpairs                    # dataset -> "#bookmark:guid,..." cursor lineage evidence
 declare -A encroot encon             # encryptionroot / encryption per dataset
 
+# [exclusions] (fleet.conf, delivered via the generated run config): the
+# named subtrees do not exist as far as this run is concerned. They are
+# left out of the MANIFEST on purpose -- the receiver's absence clocks
+# then age out (and, with gc-destroy armed, reclaim) any copy it already
+# holds. The prune passes deliberately still walk them: the stage-1
+# recursive snapshot cannot skip a child, so keep-count/budget pruning
+# is what keeps an excluded dataset's snapshot pile bounded.
+excluded() {   # $1 = dataset -> 0 when an [exclusions] row covers it
+    local e
+    for e in "${exclusions[@]}"; do
+        if [[ "$1" == "$e" || "$1" == "$e"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+if excluded "$root"; then
+    echo "ERROR: tree root '$root' is excluded by config" >&2
+    exit 2
+fi
+
 # The manifest always describes the FULL source tree (it is the
 # informational truth the server's absence clocks key on, §5/§15b);
 # --single only restricts what gets PLANNED AND SENT. A root-only
 # manifest would make the server clock every receiver-side child as
-# absent-at-source.
+# absent-at-source. Excluded subtrees are the one exception, see above.
 while IFS=$'\t' read -r name typ; do
+    excluded "$name" && continue
     datasets+=( "$name" )
     dstype[$name]="$typ"
 done < <(zfs list -H -r -t filesystem,volume -o name,type "$root")

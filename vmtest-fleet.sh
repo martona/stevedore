@@ -573,10 +573,40 @@ grep -qF '"dst":"deadrecv","state":"dropped","rc":"1","why":"receiver [deadrecv]
 /usr/local/lib/stevedore/stevedore-report.sh 2>/dev/null | grep -q "FAIL.*\[deadrecv\].*failed provisioning" && ok "T22 report names the drop" || { bad "T22 report"; /usr/local/lib/stevedore/stevedore-report.sh 2>&1 | head -n 10; }
 rm -f ~/fleet-deadrecv.conf
 
+echo "=== T23: [exclusions]: subtree skipped, old copy ages out, reinclude heals ==="
+# ztest/src/b has been replicated all suite long. Exclude it: the section
+# must reach the sender bundle, the run must skip it while siblings still
+# flow, and the manifest omission must clock the receiver's existing copy
+# (orphan-since, source=local) -- aging-out is the configured lifecycle.
+# Then a same-minute reinclude run (idempotent snapshot, so no wait) must
+# send b's missing snap and clear the clock: reappearance is the all-clear.
+check "T23 precondition: $DEST/b replicated" sudo zfs list -H "$DEST/b"
+{ cat ~/fleet-test.conf; printf '\n[exclusions]\n%s   ztest/src/b\n' "$CN"; } > ~/fleet-excl.conf
+last_min=$(date +%H%M)   # fresh minute so the run mints a snap b won't have
+for _ in $(seq 1 130); do [ "$(date +%H%M)" != "$last_min" ] && break; sleep 1; done
+/usr/local/lib/stevedore/stevedore-fleetrun.sh -c ~/fleet-excl.conf --keep >/tmp/fleet23.log 2>&1
+rc=$?
+check "T23 excluded run rc=0" test "$rc" -eq 0
+rdir=$(ls -dt /tmp/stevedore-fleet.* 2>/dev/null | head -n 1)
+grep -A1 '^\[exclusions\]' "$rdir/bundle-$CN/run.conf" 2>/dev/null | grep -qx "ztest/src/b" \
+    && ok "T23 [exclusions] reached the sender bundle" || { bad "T23 bundle"; cat "$rdir/bundle-$CN/run.conf" 2>/dev/null; }
+snap=$(sudo zfs list -H -d 1 -t snapshot -s creation -o name ztest/src | tail -n 1 | cut -d@ -f2)
+check "T23 sibling a got the run snap" sudo zfs list -H "$DEST/a@$snap"
+check "T23 excluded b did NOT" bash -c "! sudo zfs list -H '$DEST/b@$snap' 2>/dev/null"
+check "T23 b clocked absent-at-source" \
+    bash -c "test -n \"\$(sudo zfs get -H -s local -o value stevedore:orphan-since '$DEST/b' 2>/dev/null)\""
+/usr/local/lib/stevedore/stevedore-fleetrun.sh -c ~/fleet-test.conf >/tmp/fleet23b.log 2>&1
+rc=$?
+check "T23 reinclude run rc=0" test "$rc" -eq 0
+check "T23 reinclude sent b's missing snap" sudo zfs list -H "$DEST/b@$snap"
+check "T23 reappearance cleared the clock" \
+    bash -c "test -z \"\$(sudo zfs get -H -s local -o value stevedore:orphan-since '$DEST/b' 2>/dev/null)\""
+rm -rf ~/fleet-excl.conf "$rdir"
+
 echo
 echo "=== RESULT: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
-    for f in /tmp/fleet1.log /tmp/fleet2.log /tmp/fleet3.log /tmp/fleet4.log /tmp/fleet5.log /tmp/fleet6.log /tmp/fleet7.log /tmp/fleet8.log /tmp/fleet9.log /tmp/fleet10.log /tmp/fleet11.log /tmp/fleet12.log /tmp/fleet13.log /tmp/fleet14.log /tmp/fleet15.log /tmp/fleet16.log /tmp/fleet17.log /tmp/fleet18.log /tmp/fleet19.log /tmp/fleet20.log /tmp/fleet21.log /tmp/fleet22.log; do
+    for f in /tmp/fleet1.log /tmp/fleet2.log /tmp/fleet3.log /tmp/fleet4.log /tmp/fleet5.log /tmp/fleet6.log /tmp/fleet7.log /tmp/fleet8.log /tmp/fleet9.log /tmp/fleet10.log /tmp/fleet11.log /tmp/fleet12.log /tmp/fleet13.log /tmp/fleet14.log /tmp/fleet15.log /tmp/fleet16.log /tmp/fleet17.log /tmp/fleet18.log /tmp/fleet19.log /tmp/fleet20.log /tmp/fleet21.log /tmp/fleet22.log /tmp/fleet23.log /tmp/fleet23b.log; do
         [ -f "$f" ] && { echo "--- $f tail ---"; tail -n 25 "$f"; }
     done
     for u in stevedore-run-vmrecv stevedore-run-vmrecv2 stevedore-ha-vmrecv stevedore-ha-vmrecv2; do

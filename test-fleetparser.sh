@@ -228,5 +228,64 @@ b recv=t/r
 [jobs]
 a tree b frobnicate=9' 4 "unknown job attribute"
 
+# ---- [exclusions]: subtrees dropped from plan + manifest ---------------
+cat > "$FX/excl.conf" <<'EOF'
+[hosts]
+b recv=t/r
+
+[jobs]
+zeus   rpool     b
+zeus   rust/vm   b
+odin   rpool     b
+
+[exclusions]
+zeus   rpool/zvols/frigate-storage
+zeus   rpool/scratch
+odin   rpool/tmp
+EOF
+o=$(bash -c "source '$FP'; fleet_parse '$FX/excl.conf';
+    echo \"ex_zeus=[\${fleet_excl_src[zeus]}] ex_odin=[\${fleet_excl_src[odin]}] ex_none=[\${fleet_excl_src[b]:-}]\"" 2>&1)
+rc=$?
+[[ $rc -eq 0 ]] && ok "excl.conf parses (rc=0)" || { bad "excl.conf rc=$rc"; echo "$o"; }
+grep -q "ex_zeus=\[rpool/zvols/frigate-storage rpool/scratch\] ex_odin=\[rpool/tmp\] ex_none=\[\]" <<<"$o" \
+    && ok "exclusions grouped per source, absent source empty" || bad "exclusions: $o"
+
+expect_fatal exclwholetree '[hosts]
+b recv=t/r
+[jobs]
+zeus rpool b
+[exclusions]
+zeus rpool' EOF "is the whole tree"
+
+expect_fatal exclnotree '[hosts]
+b recv=t/r
+[jobs]
+zeus rpool b
+[exclusions]
+zeus rust/vm/foo' EOF "under no tree"
+
+expect_fatal exclwrongsrc '[hosts]
+b recv=t/r
+[jobs]
+zeus rpool b
+odin rust b
+[exclusions]
+odin rpool/tmp' EOF "under no tree"
+
+expect_fatal excldup '[hosts]
+b recv=t/r
+[jobs]
+zeus rpool b
+[exclusions]
+zeus rpool/tmp
+zeus rpool/tmp' 7 "duplicate exclusion"
+
+expect_fatal exclcols '[hosts]
+b recv=t/r
+[jobs]
+zeus rpool b
+[exclusions]
+zeus rpool/tmp surplus' 6 "exactly 2 columns"
+
 echo "=== RESULT: $PASS passed, $FAIL failed ==="
 [[ $FAIL -eq 0 ]]

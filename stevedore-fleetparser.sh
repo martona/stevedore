@@ -17,6 +17,10 @@
 #   fleet_job_snaps[]   assoc by "src|tree": raw budget from [source-quota]
 #                       rows ('source tree value'; EOF-checked against the
 #                       job rows), sparse
+#   fleet_excl_src[]    assoc by source: space-joined excluded datasets from
+#                       [exclusions] rows ('source dataset'; EOF-checked:
+#                       each must sit strictly INSIDE a tree that source
+#                       has a job row for), sparse
 #   fleet_sources[] fleet_receivers[] fleet_participants[]   derived, deduped,
 #                                                            first-seen order
 # Helpers:
@@ -45,6 +49,7 @@ fleet_ret_destination=""
 declare -A fleet_host_ssh fleet_host_data fleet_host_recv fleet_host_ec2 fleet_host_bind fleet_host_cadence
 declare -A _fleet_host_seen _fleet_job_seen
 declare -A fleet_job_snaps _fleet_snaps_seen   # keyed "src|tree"
+declare -A fleet_excl_src _fleet_excl_seen     # by source / by "src|dataset"
 fleet_job_src=()
 fleet_job_tree=()
 fleet_job_dest=()
@@ -187,6 +192,25 @@ _fleet_srcquota_line() {
     fleet_job_snaps[$key]="$v"
 }
 
+# [exclusions] rows: 'source dataset', one row per excluded subtree. The
+# dataset and everything under it are invisible to that source's runs:
+# never snapshotted for the plan, never sent, and OMITTED from the
+# manifest, so a receiver holding an old copy ages it out through the
+# normal orphan clocks (that reclaim is the point, not a side effect).
+# Cross-checked at EOF: the dataset must sit strictly INSIDE a tree the
+# source has a job row for -- equal to the tree root would silently
+# exclude the whole job, and typos die at parse time.
+_fleet_excl_line() {
+    (( $# == 2 )) || _fleet_fatal "exclusion rows are 'source dataset' (exactly 2 columns)"
+    local s="$1" d="$2"
+    [[ "$s" =~ $FLEET_RE_IDENT ]] || _fleet_fatal "bad source '$s'"
+    [[ "$d" =~ $FLEET_RE_TREE ]]  || _fleet_fatal "bad dataset '$d'"
+    local key="$s|$d"
+    [[ -n "${_fleet_excl_seen[$key]:-}" ]] && _fleet_fatal "duplicate exclusion for '$s $d'"
+    _fleet_excl_seen[$key]=1
+    fleet_excl_src[$s]="${fleet_excl_src[$s]:-}${fleet_excl_src[$s]:+ }$d"
+}
+
 fleet_parse() {
     local -
     set -f                       # we word-split config lines; never glob them
@@ -202,7 +226,7 @@ fleet_parse() {
         if [[ $line =~ ^\[(.*)\]$ ]]; then
             section="${BASH_REMATCH[1]}"
             case "$section" in
-                options|retention|hosts|jobs|source-quota) ;;
+                options|retention|hosts|jobs|source-quota|exclusions) ;;
                 *) _fleet_fatal "unknown section [$section]" ;;
             esac
             continue
@@ -214,6 +238,7 @@ fleet_parse() {
             hosts)        _fleet_host_line     $line ;;
             jobs)         _fleet_job_line      $line ;;
             source-quota) _fleet_srcquota_line $line ;;
+            exclusions)   _fleet_excl_line    $line ;;
         esac
     done < "$cfg"
 
@@ -242,6 +267,22 @@ fleet_parse() {
     for k in "${!fleet_job_snaps[@]}"; do
         [[ -n "${_fleet_st[$k]:-}" ]] \
             || _fleet_fatal "source-quota for '${k%%|*} ${k#*|}' matches no job row"
+    done
+    # exclusions must sit strictly inside a tree the source actually sends
+    local s x t hit
+    for s in "${!fleet_excl_src[@]}"; do
+        for x in ${fleet_excl_src[$s]}; do
+            hit=""
+            for k in "${!_fleet_st[@]}"; do
+                [[ "${k%%|*}" == "$s" ]] || continue
+                t="${k#*|}"
+                [[ "$x" == "$t" ]] \
+                    && _fleet_fatal "exclusion '$s $x' is the whole tree; drop the job row instead"
+                [[ "$x" == "$t"/* ]] && hit=1
+            done
+            [[ -n "$hit" ]] \
+                || _fleet_fatal "exclusion '$s $x' is under no tree a job row sends for '$s'"
+        done
     done
     fleet_derive
 }
