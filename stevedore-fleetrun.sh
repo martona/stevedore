@@ -734,8 +734,11 @@ provision_host() {   # $1 = host identity
         postship=" && sudo -n sh -c 'cat $rdir/client.pem $rdir/client.key > $rdir/haproxy.pem && chmod 600 $rdir/haproxy.pem'"
     fi
 
+    # --warning=no-timestamp: bundle files are seconds old, so sub-second
+    # clock skew makes the remote tar whine "time stamp ... in the future"
+    # for every file; mtimes carry no meaning for run-minted certs/confs
     if ! tar czf - -C "$bdir" . | fleet_ssh "$dest" \
-        "sudo -n tar xzf - -C $rdir && sudo -n cp $rdir/client.key $rdir/server.key && sudo -n chmod 600 $rdir/server.key$postship"; then
+        "sudo -n tar xzf - --warning=no-timestamp -C $rdir && sudo -n cp $rdir/client.key $rdir/server.key && sudo -n chmod 600 $rdir/server.key$postship"; then
         echo "ERROR: bundle ship to [$id] failed" >&2
         return 1
     fi
@@ -744,7 +747,7 @@ provision_host() {   # $1 = host identity
     # install step ever runs there), and version skew cannot exist within
     # a run
     if ! tar czf - -C "$here" "${STEVE_FILES[@]}" | fleet_ssh "$dest" \
-        "sudo -n mkdir -p $STEVE_LIB && sudo -n tar xzf - -C $STEVE_LIB --unlink-first"; then
+        "sudo -n mkdir -p $STEVE_LIB && sudo -n tar xzf - --warning=no-timestamp -C $STEVE_LIB --unlink-first"; then
         echo "ERROR: script ship to [$id] failed" >&2
         return 1
     fi
