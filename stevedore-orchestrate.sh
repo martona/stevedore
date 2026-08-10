@@ -98,6 +98,13 @@ done
 declare -A src_load=() dest_load=()      # identity -> currently running jobs
 declare -A dead_src=() dead_pair=()      # "src" / "src|dst" -> poisoned this run
 declare -A dead_why=()                   # src -> reason when not plain unreachability
+declare -A dead_dest=()                  # host wedged as a RECEIVER too (snapshot
+                                         # timeout only: a suspended pool is host-level
+                                         # evidence -- shared controller fate -- and
+                                         # receives into it hang in D-state through the
+                                         # result timeout. Plain ssh 255 deliberately
+                                         # does NOT land here: control plane != data
+                                         # plane, and a dead listener refuses cheaply.)
 pids=()
 logdir=""
 QUIET=""                                 # live board: defer per-job messages
@@ -137,6 +144,10 @@ pick_job() {
         src="${J_SRC[i]}"; dst="${J_DST[i]}"
         if [[ -n "${dead_src[$src]:-}" ]]; then
             J_STATE[i]="skipped"; J_WHY[i]="source dead this run"
+            continue
+        fi
+        if [[ -n "${dead_dest[$dst]:-}" ]]; then
+            J_STATE[i]="skipped"; J_WHY[i]="receiver wedged (snapshot timeout on its pools)"
             continue
         fi
         if [[ -n "${dead_pair["$src|$dst"]:-}" ]]; then
@@ -240,6 +251,7 @@ for (( i = 0; i < njobs; i++ )); do
         echo "ERROR: [$src] snapshot-pre timed out after ${STEVEDORE_SNAP_TIMEOUT:-180}s (pool wedged?); skipping all its jobs" >&2
         dead_src[$src]=1
         dead_why[$src]="source wedged (snapshot timeout)"
+        dead_dest[$src]=1
         snapdone[$key]="failed"
     elif (( src_rc == 255 )); then
         echo "ERROR: [$src] unreachable; skipping all its jobs" >&2
