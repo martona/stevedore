@@ -97,6 +97,7 @@ for (( i = 0; i < njobs; i++ )); do
 done
 declare -A src_load=() dest_load=()      # identity -> currently running jobs
 declare -A dead_src=() dead_pair=()      # "src" / "src|dst" -> poisoned this run
+declare -A dead_why=()                   # src -> reason when not plain unreachability
 pids=()
 logdir=""
 QUIET=""                                 # live board: defer per-job messages
@@ -224,13 +225,23 @@ for (( i = 0; i < njobs; i++ )); do
         continue
     fi
     echo "snapshot-pre: [$src] $tree@$snap" >&2
+    # timeout: a snapshot is a sub-second sync task, but on a SUSPENDED
+    # pool (failmode=wait) it blocks forever and there is no receiver or
+    # session timeout on this path -- a wedged source must not wedge the
+    # run (jupiter's controller lockup, 2026-08-09). rc 124 = the remote
+    # command never returned; the ssh connection itself was fine.
     set +e
-    ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
+    timeout "${STEVEDORE_SNAP_TIMEOUT:-180}" ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
         "sudo -n sh -c 'zfs snapshot -r $tree@$snap 2>/dev/null || zfs list -H $tree@$snap >/dev/null 2>&1'" \
         </dev/null
     src_rc=$?
     set -e
-    if (( src_rc == 255 )); then
+    if (( src_rc == 124 )); then
+        echo "ERROR: [$src] snapshot-pre timed out after ${STEVEDORE_SNAP_TIMEOUT:-180}s (pool wedged?); skipping all its jobs" >&2
+        dead_src[$src]=1
+        dead_why[$src]="source wedged (snapshot timeout)"
+        snapdone[$key]="failed"
+    elif (( src_rc == 255 )); then
         echo "ERROR: [$src] unreachable; skipping all its jobs" >&2
         dead_src[$src]=1
         snapdone[$key]="failed"
@@ -245,7 +256,7 @@ for (( i = 0; i < njobs; i++ )); do
     key="${J_SRC[i]}|${J_TREE[i]}"
     if [[ "${J_STATE[i]}" == "pending" && "${snapdone[$key]}" != "ok" ]]; then
         if [[ -n "${dead_src[${J_SRC[i]}]:-}" ]]; then
-            J_STATE[i]="skipped"; J_WHY[i]="source unreachable"
+            J_STATE[i]="skipped"; J_WHY[i]="${dead_why[${J_SRC[i]}]:-source unreachable}"
         else
             J_STATE[i]="done"; J_RC[i]=1; J_WHY[i]="snapshot failed"
         fi

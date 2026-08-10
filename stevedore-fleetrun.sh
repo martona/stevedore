@@ -131,6 +131,26 @@ append_dropped_jobs() {
     done >> "$report_dir/runs.jsonl" 2>/dev/null || true
 }
 
+# A killed run must still close its positional group: orchestrate appends
+# its finished jobs' ledger lines as they happen, and without a closing
+# run record report.sh attributes them to the NEXT run's record
+# (discovered 2026-08-09: a ^C'd run's suspended-pool refusals rendered
+# under the following run's id). Runs from the EXIT trap; every normal
+# record-writing path sets ledger_sealed first, making this a no-op.
+ledger_sealed=""
+seal_ledger() {   # $1 = exit code of the dying run
+    [[ -n "$ledger_sealed" ]] && return 0
+    ledger_sealed=1
+    report_dir_resolve
+    if [[ -n "$report_dir" ]]; then
+        append_cadence_jobs
+        append_dropped_jobs
+        printf '{"ts":"%s","kind":"run","run":"%s","rc":%s,"recv":[],"src":[],"gc":[]}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "${1:-1}" \
+            >> "$report_dir/runs.jsonl" 2>/dev/null || true
+    fi
+}
+
 #
 # ---------- 0. cadence filter (PROTOCOL.md §22) ------------------------------
 #
@@ -180,6 +200,7 @@ if [[ -n "$skip_ec2" ]]; then
     fi
 fi
 
+declare -A probe_dead=()     # sources the cadence probe found unreachable
 has_cadence=""
 for h in "${fleet_receivers[@]}"; do
     if [[ -n "${fleet_host_cadence[$h]:-}" ]]; then
@@ -221,9 +242,11 @@ if [[ -n "$has_cadence" && -z "$force_ec2" ]]; then
     # skip forever). Probe only the sources that would block, in
     # parallel; an offline source's cadence-dest jobs skip this run with
     # the window not consulted, and the first run after it returns sees
-    # the stale tuple again and wakes as normal. Its jobs to
-    # non-cadence destinations are untouched (they fail provisioning
-    # loudly, rc=1, as today).
+    # the stale tuple again and wakes as normal. The probe's verdict is
+    # authoritative for the WHOLE run: its jobs to non-cadence
+    # destinations are pre-dropped too (probe_dead -> prov_failed before
+    # provisioning), instead of burning a second connect timeout to
+    # rediscover the same dead host (owner, 2026-08-09).
     declare -A probe_set=() src_reach=()
     for (( i = 0; i < ${#fleet_job_src[@]}; i++ )); do
         d="${fleet_job_dest[i]}"
@@ -248,6 +271,7 @@ if [[ -n "$has_cadence" && -z "$force_ec2" ]]; then
         if wait "${probe_pids[i]}"; then
             src_reach[${probe_hosts[i]}]=1
         else
+            probe_dead[${probe_hosts[i]}]=1
             echo "cadence: source [${probe_hosts[i]}] unreachable; its jobs to cadence destinations skip this run" >&2
         fi
     done
@@ -427,6 +451,7 @@ if (( ${#fleet_job_src[@]} == 0 )); then
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" \
             >> "$report_dir/runs.jsonl" 2>/dev/null || true
     fi
+    ledger_sealed=1
     exit 0
 fi
 
@@ -435,6 +460,30 @@ provisioned=()
 listeners=()
 ha_started=()
 declare -A prov_failed=()    # identity -> 1; dropped from the run, forces rc 1
+declare -A prov_why=()       # identity -> drop reason when not "failed provisioning"
+declare -A prov_touched=()   # identity -> 1 once provisioning ssh'd it (teardown gate)
+
+# The cadence probe already found these sources dead; pre-drop them so
+# provisioning does not burn a second connect timeout, teardown does not
+# ssh a host we never contacted, and the ledger names the real reason.
+# Only when jobs REMAIN post-trim: a source whose every job was
+# cadence-skipped is scheduling, not failure (rc 0 doctrine, §22) --
+# prov_failed would force rc 1.
+for h in "${!probe_dead[@]}"; do
+    _pd_has_job=""
+    for (( _pd_i = 0; _pd_i < ${#fleet_job_src[@]}; _pd_i++ )); do
+        if [[ "${fleet_job_src[_pd_i]}" == "$h" ]]; then
+            _pd_has_job=1
+            break
+        fi
+    done
+    if [[ -z "$_pd_has_job" ]]; then
+        continue
+    fi
+    prov_failed[$h]=1
+    prov_why[$h]="unreachable (cadence probe)"
+    echo "skipping [$h]: unreachable at cadence probe; dropping all its jobs from this run" >&2
+done
 
 is_receiver() {
     local r
@@ -488,8 +537,11 @@ fleet_teardown() {
     done
     # prov_failed hosts too: a mid-provision failure can leave a partial
     # run dir behind, and the cleanup attempt is cheap if they are still
-    # offline (fast refusal or one timeout).
+    # offline (fast refusal or one timeout). But only hosts provisioning
+    # actually CONTACTED -- a probe-dead host was never touched, so there
+    # is nothing remote to clean and the ssh would just time out again.
     for h in "${provisioned[@]}" "${!prov_failed[@]}"; do
+        [[ -z "${prov_touched[$h]:-}" ]] && continue
         dest=$(fleet_ssh_dest "$h")
         fleet_ssh "$dest" "sudo -n rm -rf $RUN_REMOTE_BASE/$h; sudo -n rmdir $RUN_REMOTE_BASE 2>/dev/null || true" \
             </dev/null || echo "WARNING: could not remove $RUN_REMOTE_BASE/$h on [$h]" >&2
@@ -508,7 +560,7 @@ orchec2up=( "${wake_ids[@]}" )
 ec2_maybe_start
 # ec2_maybe_start installed its own EXIT trap; combine with teardown so a
 # failure at any later point still stops instances AND cleans up hosts.
-trap 'fleet_teardown; stop_ec2_instances' EXIT
+trap 'seal_ledger $?; fleet_teardown; stop_ec2_instances' EXIT
 
 #
 # ---------- 2. mint the run CA -----------------------------------------------
@@ -638,6 +690,7 @@ provision_host() {   # $1 = host identity
     rdir="$RUN_REMOTE_BASE/$id"
     mkdir -p "$bdir"
     echo "provisioning [$id] ($dest)" >&2
+    prov_touched[$id]=1
 
     # dependency preflight + key/CSR minted on the host; only the CSR
     # travels back. Every step reports and RETURNS 1 instead of dying: one
@@ -799,13 +852,16 @@ start_haproxy() {   # $1 = participant identity
 # error, every sender's haproxy died at start, every sender went
 # prov_failed -- 2026-08-04.)
 for h in "${fleet_receivers[@]}"; do
+    if [[ -n "${prov_failed[$h]:-}" ]]; then
+        continue
+    fi
     if ! provision_host "$h"; then
         prov_failed[$h]=1
         echo "ERROR: provisioning [$h] failed; dropping its jobs from this run" >&2
     fi
 done
 for h in "${fleet_sources[@]}"; do
-    if is_receiver "$h"; then
+    if [[ -n "${prov_failed[$h]:-}" ]] || is_receiver "$h"; then
         continue
     fi
     if ! provision_host "$h"; then
@@ -886,9 +942,9 @@ runnable=0
             drop_tree+=( "${fleet_job_tree[i]}" )
             drop_dest+=( "${fleet_job_dest[i]}" )
             if [[ -n "${prov_failed[${fleet_job_src[i]}]:-}" ]]; then
-                drop_why+=( "source [${fleet_job_src[i]}] failed provisioning" )
+                drop_why+=( "source [${fleet_job_src[i]}] ${prov_why[${fleet_job_src[i]}]:-failed provisioning}" )
             else
-                drop_why+=( "receiver [${fleet_job_dest[i]}] failed provisioning" )
+                drop_why+=( "receiver [${fleet_job_dest[i]}] ${prov_why[${fleet_job_dest[i]}]:-failed provisioning}" )
             fi
             continue
         fi
@@ -915,6 +971,7 @@ if (( runnable == 0 )); then
             "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" \
             >> "$report_dir/runs.jsonl" 2>/dev/null || true
     fi
+    ledger_sealed=1
     exit 1
 fi
 
@@ -1063,6 +1120,7 @@ if [[ -n "$report_json" || ${#cad_src[@]} -gt 0 || ${#drop_src[@]} -gt 0 ]]; the
             >> "$report_dir/runs.jsonl" 2>/dev/null || true
     fi
 fi
+ledger_sealed=1
 
 echo "run $run_id finished (rc=$orch_rc); tearing down" >&2
 exit "$orch_rc"
