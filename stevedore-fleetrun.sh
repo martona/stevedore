@@ -573,7 +573,7 @@ fleet_teardown() {
         fi
     done
     if (( ${#_td_hosts[@]} > 0 )); then
-        fleet_par 16 _teardown_host "${_td_hosts[@]}"
+        fleet_par "teardown" 16 _teardown_host "${_td_hosts[@]}"
         for h in "${_td_hosts[@]}"; do
             if [[ -n "${fleet_par_out[$h]:-}" ]]; then
                 printf '%s\n' "${fleet_par_out[$h]}" >&2
@@ -895,8 +895,9 @@ start_haproxy() {   # $1 = participant identity
 # for [tunnel]/haproxy filtering, §29). provision_host is pure now: the
 # collector owns provisioned/prov_touched/prov_failed -- a background
 # subshell's global writes die with it.
-_prov_wave() {   # $@ = candidate hosts
-    local h
+_prov_wave() {   # $1 = wave label, rest = candidate hosts
+    local label="$1" h
+    shift
     local -a wave=()
     for h in "$@"; do
         if [[ -z "${prov_failed[$h]:-}" ]]; then
@@ -906,7 +907,7 @@ _prov_wave() {   # $@ = candidate hosts
     if (( ${#wave[@]} == 0 )); then
         return 0
     fi
-    fleet_par 16 provision_host "${wave[@]}"
+    fleet_par "$label" 16 provision_host "${wave[@]}"
     for h in "${wave[@]}"; do
         prov_touched[$h]=1
         if [[ -n "${fleet_par_out[$h]:-}" ]]; then
@@ -920,14 +921,14 @@ _prov_wave() {   # $@ = candidate hosts
         fi
     done
 }
-_prov_wave "${fleet_receivers[@]}"
+_prov_wave "provisioning (receivers)" "${fleet_receivers[@]}"
 _prov_srconly=()
 for h in "${fleet_sources[@]}"; do
     if ! is_receiver "$h"; then
         _prov_srconly+=( "$h" )
     fi
 done
-_prov_wave "${_prov_srconly[@]}"
+_prov_wave "provisioning (senders)" "${_prov_srconly[@]}"
 
 # Space accounting for the run report: recv_root `used` before any bytes
 # move; the delta at the end is the run's net effect on the pool.
@@ -942,13 +943,13 @@ done
 # Parallel start waves (fleet_par): failures collect into prov_failed
 # exactly as the serial loops did; listeners[]/ha_started[] are collector
 # business (task fns are pure).
-_start_wave() {   # $1 = task fn, $2 = "listeners"|"ha", $3 = error noun, rest = hosts
-    local fn="$1" reg="$2" noun="$3" h
-    shift 3
+_start_wave() {   # $1 = label, $2 = task fn, $3 = "listeners"|"ha", $4 = error noun, rest = hosts
+    local label="$1" fn="$2" reg="$3" noun="$4" h
+    shift 4
     if (( $# == 0 )); then
         return 0
     fi
-    fleet_par 16 "$fn" "$@"
+    fleet_par "$label" 16 "$fn" "$@"
     for h in "$@"; do
         if [[ -n "${fleet_par_out[$h]:-}" ]]; then
             printf '%s\n' "${fleet_par_out[$h]}" >&2
@@ -969,7 +970,7 @@ for h in "${fleet_receivers[@]}"; do
         _lsn_wave+=( "$h" )
     fi
 done
-_start_wave start_listener listeners "run listener" "${_lsn_wave[@]}"
+_start_wave "run listeners" start_listener listeners "run listener" "${_lsn_wave[@]}"
 if [[ "$fleet_opt_transport" == "haproxy" ]]; then
     # receivers first: senders' backends dial their TLS frontends.
     # Dual-role boxes get their (combined) haproxy in this first pass.
@@ -982,7 +983,7 @@ if [[ "$fleet_opt_transport" == "haproxy" ]]; then
             _ha_wave+=( "$h" )
         fi
     done
-    _start_wave start_haproxy ha haproxy "${_ha_wave[@]}"
+    _start_wave "haproxy (receivers)" start_haproxy ha haproxy "${_ha_wave[@]}"
     _ha_wave=()
     for h in "${fleet_sources[@]}"; do
         if [[ -n "${prov_failed[$h]:-}" ]] || is_receiver "$h"; then
@@ -1003,7 +1004,7 @@ if [[ "$fleet_opt_transport" == "haproxy" ]]; then
         fi
         _ha_wave+=( "$h" )
     done
-    _start_wave start_haproxy ha haproxy "${_ha_wave[@]}"
+    _start_wave "haproxy (senders)" start_haproxy ha haproxy "${_ha_wave[@]}"
 fi
 
 #
@@ -1104,7 +1105,7 @@ for h in "${fleet_receivers[@]}"; do
     fi
 done
 if (( ${#_gc_wave[@]} > 0 )); then
-    fleet_par 16 _gc_host "${_gc_wave[@]}"
+    fleet_par "gc" 16 _gc_host "${_gc_wave[@]}"
 fi
 for h in "${_gc_wave[@]}"; do
     echo "gc: [$h]" >&2

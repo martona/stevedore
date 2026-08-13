@@ -5,7 +5,12 @@
 # stages (provision, listeners, haproxy, snapshot-pre, prune-post, gc,
 # teardown) -- PROTOCOL.md §33.
 #
-#   fleet_par <max_jobs> <task_fn> <item>...
+#   fleet_par <label> <max_jobs> <task_fn> <item>...
+#
+# <label> prints one intro line to stderr BEFORE the fan-out ("<label>:
+# N task(s) across W workers") -- collectors replay task output only
+# after the wave, so without it a long wave is silence where the old
+# serial loops chattered (owner ask, 2026-08-13). Empty label = silent.
 #
 # Each item runs as "task_fn <item>" in a background subshell, stdout+
 # stderr captured to a private per-item file; at most <max_jobs> run at
@@ -35,11 +40,15 @@ declare -A fleet_par_rc=() fleet_par_out=() fleet_par_data=()
 fleet_par() {
     local -                      # confine the set±e dance (§17 invariant)
     set +e
-    local max="$1" fn="$2"
-    shift 2
+    local label="$1" max="$2" fn="$3"
+    shift 3
     fleet_par_rc=(); fleet_par_out=(); fleet_par_data=()
     if (( $# == 0 )); then
         return 0
+    fi
+    if [[ -n "$label" ]]; then
+        local w=$(( $# < max ? $# : max ))
+        echo "$label: $# task(s) across $w workers" >&2
     fi
     local tmp
     tmp=$(mktemp -d "${TMPDIR:-/tmp}/stevedore-par.XXXXXX") || {

@@ -285,7 +285,7 @@ for (( i = 0; i < njobs; i++ )); do
     _snap_trees[$src]="${_snap_trees[$src]:-}${_snap_trees[$src]:+ }$tree"
 done
 if (( ${#_snap_srcs[@]} > 0 )); then
-    fleet_par 16 _snap_task "${_snap_srcs[@]}"
+    fleet_par "snapshot-pre" 16 _snap_task "${_snap_srcs[@]}"
 fi
 for src in "${_snap_srcs[@]}"; do
     if [[ -n "${fleet_par_out[$src]:-}" ]]; then
@@ -546,7 +546,7 @@ for key in "${pp_keys[@]}"; do
     _pp_by_src[$src]="${_pp_by_src[$src]:-}${_pp_by_src[$src]:+ }$i"
 done
 if (( ${#_pp_srcs[@]} > 0 )); then
-    fleet_par 16 _pp_task "${_pp_srcs[@]}"
+    fleet_par "prune-post" 16 _pp_task "${_pp_srcs[@]}"
     for src in "${_pp_srcs[@]}"; do
         if [[ -n "${fleet_par_out[$src]:-}" ]]; then
             printf '%s\n' "${fleet_par_out[$src]}" >&2
