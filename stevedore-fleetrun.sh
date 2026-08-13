@@ -36,6 +36,7 @@ set -f
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$here/stevedore-paths.sh"
 source "$here/stevedore-ec2helpers.sh"
+source "$here/stevedore-par.sh"
 source "$here/stevedore-fleetparser.sh"
 
 FLEET_CONF="$STEVE_ETC/fleet.conf"
@@ -462,6 +463,7 @@ ha_started=()
 declare -A prov_failed=()    # identity -> 1; dropped from the run, forces rc 1
 declare -A prov_why=()       # identity -> drop reason when not "failed provisioning"
 declare -A prov_touched=()   # identity -> 1 once provisioning ssh'd it (teardown gate)
+declare -A _td_ha=() _td_ln=() _td_rd=()   # teardown role maps (see fleet_teardown)
 
 # The cadence probe already found these sources dead; pre-drop them so
 # provisioning does not burn a second connect timeout, teardown does not
@@ -518,34 +520,66 @@ if [[ "$fleet_opt_transport" == "haproxy" ]]; then
     done
 fi
 
-fleet_teardown() {
-    # stop + reset-failed are best-effort: a CLEANLY stopped transient
-    # unit is removed instantly, making reset-failed whine "not loaded"
-    # -- rc noise, not a failure (first real H run warned on every host
-    # while every haproxy was in fact down). The verdict is the final
-    # is-active: warn only when a unit actually survived teardown.
-    local h dest
-    for h in "${ha_started[@]}"; do
-        dest=$(fleet_ssh_dest "$h")
+# Per-host teardown task (fleet_par): every role the host held, in one
+# ssh-serial task -- ha stop, listener stop, run-dir removal. Pure: the
+# collector replays output; warnings carry the host name already.
+# stop + reset-failed are best-effort: a CLEANLY stopped transient
+# unit is removed instantly, making reset-failed whine "not loaded"
+# -- rc noise, not a failure (first real H run warned on every host
+# while every haproxy was in fact down). The verdict is the final
+# is-active: warn only when a unit actually survived teardown.
+_teardown_host() {
+    local h="$1" dest
+    dest=$(fleet_ssh_dest "$h")
+    if [[ -n "${_td_ha[$h]:-}" ]]; then
         fleet_ssh "$dest" "sudo -n systemctl stop stevedore-ha-$h 2>/dev/null; sudo -n systemctl reset-failed stevedore-ha-$h 2>/dev/null; ! systemctl is-active --quiet stevedore-ha-$h" \
             </dev/null || echo "WARNING: haproxy unit still active on [$h]" >&2
-    done
-    for h in "${listeners[@]}"; do
-        dest=$(fleet_ssh_dest "$h")
+    fi
+    if [[ -n "${_td_ln[$h]:-}" ]]; then
         fleet_ssh "$dest" "sudo -n systemctl stop stevedore-run-$h 2>/dev/null; sudo -n systemctl reset-failed stevedore-run-$h 2>/dev/null; ! systemctl is-active --quiet stevedore-run-$h" \
             </dev/null || echo "WARNING: run listener still active on [$h]" >&2
-    done
-    # prov_failed hosts too: a mid-provision failure can leave a partial
-    # run dir behind, and the cleanup attempt is cheap if they are still
-    # offline (fast refusal or one timeout). But only hosts provisioning
-    # actually CONTACTED -- a probe-dead host was never touched, so there
-    # is nothing remote to clean and the ssh would just time out again.
-    for h in "${provisioned[@]}" "${!prov_failed[@]}"; do
-        [[ -z "${prov_touched[$h]:-}" ]] && continue
-        dest=$(fleet_ssh_dest "$h")
+    fi
+    if [[ -n "${_td_rd[$h]:-}" ]]; then
         fleet_ssh "$dest" "sudo -n rm -rf $RUN_REMOTE_BASE/$h; sudo -n rmdir $RUN_REMOTE_BASE 2>/dev/null || true" \
             </dev/null || echo "WARNING: could not remove $RUN_REMOTE_BASE/$h on [$h]" >&2
+    fi
+    return 0
+}
+
+fleet_teardown() {
+    # One parallel wave over the union of hosts with anything to clean
+    # (wall time = slowest host, not the sum -- teardown lives under the
+    # timer's TimeoutStopSec budget, where serial ConnectTimeouts of a
+    # degraded fleet could blow 300s). Membership maps are built here;
+    # the run-dir set keeps the prov_touched gate: a probe-dead host was
+    # never contacted, nothing remote to clean, the ssh would just time
+    # out again. prov_failed hosts that WERE touched still get the
+    # attempt -- a mid-provision failure can leave a partial run dir.
+    local h
+    _td_ha=(); _td_ln=(); _td_rd=()
+    local -a _td_hosts=()
+    declare -A _td_seen=()
+    for h in "${ha_started[@]}"; do _td_ha[$h]=1; done
+    for h in "${listeners[@]}"; do _td_ln[$h]=1; done
+    for h in "${provisioned[@]}" "${!prov_failed[@]}"; do
+        if [[ -n "${prov_touched[$h]:-}" ]]; then
+            _td_rd[$h]=1
+        fi
     done
+    for h in "${ha_started[@]}" "${listeners[@]}" "${provisioned[@]}" "${!prov_failed[@]}"; do
+        if [[ -z "${_td_seen[$h]:-}" && -n "${_td_ha[$h]:-}${_td_ln[$h]:-}${_td_rd[$h]:-}" ]]; then
+            _td_seen[$h]=1
+            _td_hosts+=( "$h" )
+        fi
+    done
+    if (( ${#_td_hosts[@]} > 0 )); then
+        fleet_par 16 _teardown_host "${_td_hosts[@]}"
+        for h in "${_td_hosts[@]}"; do
+            if [[ -n "${fleet_par_out[$h]:-}" ]]; then
+                printf '%s\n' "${fleet_par_out[$h]}" >&2
+            fi
+        done
+    fi
     if [[ -n "$keep_rundir" ]]; then
         echo "run artifacts kept in $rundir (--keep)" >&2
     else
@@ -690,7 +724,6 @@ provision_host() {   # $1 = host identity
     rdir="$RUN_REMOTE_BASE/$id"
     mkdir -p "$bdir"
     echo "provisioning [$id] ($dest)" >&2
-    prov_touched[$id]=1
 
     # dependency preflight + key/CSR minted on the host; only the CSR
     # travels back. Every step reports and RETURNS 1 instead of dying: one
@@ -713,10 +746,15 @@ provision_host() {   # $1 = host identity
         return 1
     fi
 
-    # sign with the run CA; SANs carry identity and dial name (H needs SANs)
+    # sign with the run CA; SANs carry identity and dial name (H needs SANs).
+    # -set_serial from the identity hash, NOT -CAcreateserial: concurrent
+    # provision tasks (fleet_par wave) would race the shared ca.srl file.
+    # Serials only need uniqueness per CA and the CA lives one run;
+    # 64 hash bits per identity is plenty.
     printf 'subjectAltName=DNS:%s,DNS:%s\n' "$id" "$data" > "$rundir/$id.ext"
     openssl x509 -req -in "$rundir/$id.csr" -CA "$rundir/ca.pem" -CAkey "$rundir/ca.key" \
-        -CAcreateserial -days 365 -extfile "$rundir/$id.ext" -out "$bdir/client.pem" 2>/dev/null
+        -set_serial "0x$(printf '%s' "$id" | sha256sum | cut -c1-16)" \
+        -days 365 -extfile "$rundir/$id.ext" -out "$bdir/client.pem" 2>/dev/null
     if ! grep -q "BEGIN CERTIFICATE" "$bdir/client.pem"; then
         echo "ERROR: signing failed for [$id]" >&2
         return 1
@@ -751,7 +789,6 @@ provision_host() {   # $1 = host identity
         echo "ERROR: script ship to [$id] failed" >&2
         return 1
     fi
-    provisioned+=( "$id" )
 }
 
 start_listener() {   # $1 = receiver identity
@@ -772,7 +809,6 @@ start_listener() {   # $1 = receiver identity
     echo "starting run listener on [$id] (port $fleet_opt_port)" >&2
     fleet_ssh "$dest" "sudo -n systemctl stop $unit 2>/dev/null; sudo -n systemctl reset-failed $unit 2>/dev/null; sudo -n systemd-run --unit=$unit --setenv=STEVEDORE_CONF=$RUN_REMOTE_BASE/$id/run.conf $STEVE_LIB/stevedore-listen.sh >/dev/null 2>&1; for i in \$(seq 1 40); do ss -tln | grep -qF '$bindpat' && exit 0; sleep 0.25; done; echo 'run listener failed to bind:' >&2; sudo -n journalctl -u $unit -n 10 --no-pager >&2; exit 1" \
         </dev/null || return 1
-    listeners+=( "$id" )
 }
 
 # One haproxy per participant per run, doing every role the box has:
@@ -844,7 +880,6 @@ start_haproxy() {   # $1 = participant identity
     echo "starting haproxy on [$id]" >&2
     fleet_ssh "$dest" "sudo -n systemctl stop $unit 2>/dev/null; sudo -n systemctl reset-failed $unit 2>/dev/null; sudo -n systemd-run --unit=$unit /usr/sbin/haproxy -db -f $rdir/haproxy.cfg >/dev/null 2>&1; for i in \$(seq 1 40); do ss -tln | grep -qF '$pat' && exit 0; sleep 0.25; done; echo 'haproxy failed to bind:' >&2; sudo -n journalctl -u $unit -n 15 --no-pager >&2; exit 1" \
         </dev/null || return 1
-    ha_started+=( "$id" )
 }
 
 # Receivers provision FIRST: their verdicts must be known before any
@@ -854,24 +889,45 @@ start_haproxy() {   # $1 = participant identity
 # backend, an unresolvable backend hostname is a fatal haproxy config
 # error, every sender's haproxy died at start, every sender went
 # prov_failed -- 2026-08-04.)
-for h in "${fleet_receivers[@]}"; do
-    if [[ -n "${prov_failed[$h]:-}" ]]; then
-        continue
+# One parallel wave per role class (fleet_par): hosts within a class are
+# independent; the receiver->source BARRIER is load-bearing (sender
+# bundle generation inside provision_host reads the receivers' verdicts
+# for [tunnel]/haproxy filtering, §29). provision_host is pure now: the
+# collector owns provisioned/prov_touched/prov_failed -- a background
+# subshell's global writes die with it.
+_prov_wave() {   # $@ = candidate hosts
+    local h
+    local -a wave=()
+    for h in "$@"; do
+        if [[ -z "${prov_failed[$h]:-}" ]]; then
+            wave+=( "$h" )
+        fi
+    done
+    if (( ${#wave[@]} == 0 )); then
+        return 0
     fi
-    if ! provision_host "$h"; then
-        prov_failed[$h]=1
-        echo "ERROR: provisioning [$h] failed; dropping its jobs from this run" >&2
-    fi
-done
+    fleet_par 16 provision_host "${wave[@]}"
+    for h in "${wave[@]}"; do
+        prov_touched[$h]=1
+        if [[ -n "${fleet_par_out[$h]:-}" ]]; then
+            printf '%s\n' "${fleet_par_out[$h]}" >&2
+        fi
+        if [[ "${fleet_par_rc[$h]}" != "0" ]]; then
+            prov_failed[$h]=1
+            echo "ERROR: provisioning [$h] failed; dropping its jobs from this run" >&2
+        else
+            provisioned+=( "$h" )
+        fi
+    done
+}
+_prov_wave "${fleet_receivers[@]}"
+_prov_srconly=()
 for h in "${fleet_sources[@]}"; do
-    if [[ -n "${prov_failed[$h]:-}" ]] || is_receiver "$h"; then
-        continue
-    fi
-    if ! provision_host "$h"; then
-        prov_failed[$h]=1
-        echo "ERROR: provisioning [$h] failed; dropping its jobs from this run" >&2
+    if ! is_receiver "$h"; then
+        _prov_srconly+=( "$h" )
     fi
 done
+_prov_wave "${_prov_srconly[@]}"
 
 # Space accounting for the run report: recv_root `used` before any bytes
 # move; the delta at the end is the run's net effect on the pool.
@@ -883,27 +939,51 @@ for h in "${fleet_receivers[@]}"; do
             || rused_before[$h]=""
     fi
 done
-for h in "${fleet_receivers[@]}"; do
-    if [[ -n "${prov_failed[$h]:-}" ]]; then
-        continue
+# Parallel start waves (fleet_par): failures collect into prov_failed
+# exactly as the serial loops did; listeners[]/ha_started[] are collector
+# business (task fns are pure).
+_start_wave() {   # $1 = task fn, $2 = "listeners"|"ha", $3 = error noun, rest = hosts
+    local fn="$1" reg="$2" noun="$3" h
+    shift 3
+    if (( $# == 0 )); then
+        return 0
     fi
-    if ! start_listener "$h"; then
-        prov_failed[$h]=1
-        echo "ERROR: run listener on [$h] failed; dropping its jobs from this run" >&2
+    fleet_par 16 "$fn" "$@"
+    for h in "$@"; do
+        if [[ -n "${fleet_par_out[$h]:-}" ]]; then
+            printf '%s\n' "${fleet_par_out[$h]}" >&2
+        fi
+        if [[ "${fleet_par_rc[$h]}" != "0" ]]; then
+            prov_failed[$h]=1
+            echo "ERROR: $noun on [$h] failed; dropping its jobs from this run" >&2
+        elif [[ "$reg" == "listeners" ]]; then
+            listeners+=( "$h" )
+        else
+            ha_started+=( "$h" )
+        fi
+    done
+}
+_lsn_wave=()
+for h in "${fleet_receivers[@]}"; do
+    if [[ -z "${prov_failed[$h]:-}" ]]; then
+        _lsn_wave+=( "$h" )
     fi
 done
+_start_wave start_listener listeners "run listener" "${_lsn_wave[@]}"
 if [[ "$fleet_opt_transport" == "haproxy" ]]; then
     # receivers first: senders' backends dial their TLS frontends.
     # Dual-role boxes get their (combined) haproxy in this first pass.
+    # The receiver->sender BARRIER also feeds the live-dest check below
+    # (a receiver whose haproxy failed just dropped out of prov_failed's
+    # complement).
+    _ha_wave=()
     for h in "${fleet_receivers[@]}"; do
-        if [[ -n "${prov_failed[$h]:-}" ]]; then
-            continue
-        fi
-        if ! start_haproxy "$h"; then
-            prov_failed[$h]=1
-            echo "ERROR: haproxy on [$h] failed; dropping its jobs from this run" >&2
+        if [[ -z "${prov_failed[$h]:-}" ]]; then
+            _ha_wave+=( "$h" )
         fi
     done
+    _start_wave start_haproxy ha haproxy "${_ha_wave[@]}"
+    _ha_wave=()
     for h in "${fleet_sources[@]}"; do
         if [[ -n "${prov_failed[$h]:-}" ]] || is_receiver "$h"; then
             continue
@@ -921,11 +1001,9 @@ if [[ "$fleet_opt_transport" == "haproxy" ]]; then
             echo "haproxy on [$h] not started (no live destinations remain)" >&2
             continue
         fi
-        if ! start_haproxy "$h"; then
-            prov_failed[$h]=1
-            echo "ERROR: haproxy on [$h] failed; dropping its jobs from this run" >&2
-        fi
+        _ha_wave+=( "$h" )
     done
+    _start_wave start_haproxy ha haproxy "${_ha_wave[@]}"
 fi
 
 #
@@ -1009,18 +1087,34 @@ if [[ "$fleet_opt_gc_destroy" == "on" ]]; then
     gcdflag=" --destroy"
     echo "gc: destroy flag is ON (fleet.conf gc-destroy); grace-expired, re-confirmed items will be reclaimed" >&2
 fi
+# gc task (fleet_par): stdout is the harvest and must stay PURE -- the
+# module merges streams, so the task parks gc.sh's stderr in the data
+# channel and the collector replays it to the console.
+_gc_host() {
+    local h="$1"
+    fleet_ssh "$(fleet_ssh_dest "$h")" \
+        "sudo -n env STEVEDORE_CONF=$RUN_REMOTE_BASE/$h/run.conf$gcenv $STEVE_LIB/stevedore-gc.sh$gcdflag" \
+        </dev/null 2>"$FLEET_PAR_DATA"
+}
 gc_json=""
+_gc_wave=()
 for h in "${fleet_receivers[@]}"; do
-    if [[ -n "${prov_failed[$h]:-}" ]]; then
-        continue
+    if [[ -z "${prov_failed[$h]:-}" ]]; then
+        _gc_wave+=( "$h" )
     fi
+done
+if (( ${#_gc_wave[@]} > 0 )); then
+    fleet_par 16 _gc_host "${_gc_wave[@]}"
+fi
+for h in "${_gc_wave[@]}"; do
     echo "gc: [$h]" >&2
+    if [[ -n "${fleet_par_data[$h]:-}" ]]; then
+        printf '%s\n' "${fleet_par_data[$h]}" >&2
+    fi
     # stdout is harvested into the run record (report.sh renders it) and
     # re-echoed verbatim -- the console keeps every line in every mode
-    gout=""
-    if ! gout=$(fleet_ssh "$(fleet_ssh_dest "$h")" \
-        "sudo -n env STEVEDORE_CONF=$RUN_REMOTE_BASE/$h/run.conf$gcenv $STEVE_LIB/stevedore-gc.sh$gcdflag" \
-        </dev/null); then
+    gout="${fleet_par_out[$h]:-}"
+    if [[ "${fleet_par_rc[$h]}" != "0" ]]; then
         echo "WARNING: gc pass failed on [$h]" >&2
     fi
     if [[ -n "$gout" ]]; then

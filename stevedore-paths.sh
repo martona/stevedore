@@ -25,6 +25,7 @@ STEVE_FILES=(
     stevedore-cfgparser.sh
     stevedore-fleetparser.sh
     stevedore-ec2helpers.sh
+    stevedore-par.sh
     stevedore-run-indented.sh
     stevedore-pp2.sh
     stevedore-retain.sh

@@ -45,6 +45,7 @@ set -euo pipefail
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 source "$here/stevedore-cfgparser.sh"
 source "$here/stevedore-ec2helpers.sh"
+source "$here/stevedore-par.sh"
 
 # One orchestrate/deploy at a time across the estate.
 orch_lock
@@ -228,41 +229,84 @@ trap orch_cleanup EXIT
 # every job of that tree up front; ssh 255 declares the source dead.
 echo "run snapshot: @$snap" >&2
 declare -A snapdone=()       # "src|tree" -> ok | failed
+
+# Per-source snapshot task (fleet_par, §33): walks the source's trees in
+# order, one ssh each, and STOPS at the first host-level death exactly
+# like the serial loop did -- remaining trees get no verdict and the
+# collector fails them. Sources run in parallel: a wedged host's 180s
+# timeout overlaps everyone else's sub-second snapshots instead of
+# serializing behind them. Per-tree verdicts ride the data channel;
+# display output replays via the collector. NB the task inherits
+# fleet_par's set +e -- no ±e dance needed (or wanted, §17) here.
+#
+# timeout: a snapshot is a sub-second sync task, but on a SUSPENDED
+# pool (failmode=wait) it blocks forever and there is no receiver or
+# session timeout on this path -- a wedged source must not wedge the
+# run (jupiter's controller lockup, 2026-08-09). rc 124 = the remote
+# command never returned; the ssh connection itself was fine.
+_snap_task() {   # $1 = source id
+    local src="$1" tree rc
+    local -a trees=()
+    read -r -a trees <<<"${_snap_trees[$src]}"
+    for tree in "${trees[@]}"; do
+        echo "snapshot-pre: [$src] $tree@$snap" >&2
+        timeout "${STEVEDORE_SNAP_TIMEOUT:-180}" ssh "${ssh_opts[@]}" "${_snap_ssh[$src]}" \
+            "sudo -n sh -c 'zfs snapshot -r $tree@$snap 2>/dev/null || zfs list -H $tree@$snap >/dev/null 2>&1'" \
+            </dev/null
+        rc=$?
+        if (( rc == 124 )); then
+            echo "ERROR: [$src] snapshot-pre timed out after ${STEVEDORE_SNAP_TIMEOUT:-180}s (pool wedged?); skipping all its jobs" >&2
+            printf 'dead-wedged -\n' >> "$FLEET_PAR_DATA"
+            return 0
+        elif (( rc == 255 )); then
+            echo "ERROR: [$src] unreachable; skipping all its jobs" >&2
+            printf 'dead-ssh -\n' >> "$FLEET_PAR_DATA"
+            return 0
+        elif (( rc != 0 )); then
+            echo "ERROR: snapshot-pre failed on [$src]: $tree@$snap" >&2
+            printf 'failed %s\n' "$tree" >> "$FLEET_PAR_DATA"
+        else
+            printf 'ok %s\n' "$tree" >> "$FLEET_PAR_DATA"
+        fi
+    done
+    return 0
+}
+
+declare -A _snap_trees=() _snap_ssh=() _snap_seen=()
+_snap_srcs=()
 for (( i = 0; i < njobs; i++ )); do
     src="${J_SRC[i]}"; tree="${J_TREE[i]}"; key="$src|$tree"
-    [[ -z "${snapdone[$key]:-}" ]] || continue
-    if [[ -n "${dead_src[$src]:-}" ]]; then
-        snapdone[$key]="failed"
-        continue
+    [[ -n "${_snap_seen[$key]:-}" ]] && continue
+    _snap_seen[$key]=1
+    if [[ -z "${_snap_trees[$src]:-}" ]]; then
+        _snap_srcs+=( "$src" )
+        _snap_ssh[$src]="${J_SSH[i]}"
     fi
-    echo "snapshot-pre: [$src] $tree@$snap" >&2
-    # timeout: a snapshot is a sub-second sync task, but on a SUSPENDED
-    # pool (failmode=wait) it blocks forever and there is no receiver or
-    # session timeout on this path -- a wedged source must not wedge the
-    # run (jupiter's controller lockup, 2026-08-09). rc 124 = the remote
-    # command never returned; the ssh connection itself was fine.
-    set +e
-    timeout "${STEVEDORE_SNAP_TIMEOUT:-180}" ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
-        "sudo -n sh -c 'zfs snapshot -r $tree@$snap 2>/dev/null || zfs list -H $tree@$snap >/dev/null 2>&1'" \
-        </dev/null
-    src_rc=$?
-    set -e
-    if (( src_rc == 124 )); then
-        echo "ERROR: [$src] snapshot-pre timed out after ${STEVEDORE_SNAP_TIMEOUT:-180}s (pool wedged?); skipping all its jobs" >&2
-        dead_src[$src]=1
-        dead_why[$src]="source wedged (snapshot timeout)"
-        dead_dest[$src]=1
-        snapdone[$key]="failed"
-    elif (( src_rc == 255 )); then
-        echo "ERROR: [$src] unreachable; skipping all its jobs" >&2
-        dead_src[$src]=1
-        snapdone[$key]="failed"
-    elif (( src_rc != 0 )); then
-        echo "ERROR: snapshot-pre failed on [$src]: $tree@$snap" >&2
-        snapdone[$key]="failed"
-    else
-        snapdone[$key]="ok"
+    _snap_trees[$src]="${_snap_trees[$src]:-}${_snap_trees[$src]:+ }$tree"
+done
+if (( ${#_snap_srcs[@]} > 0 )); then
+    fleet_par 16 _snap_task "${_snap_srcs[@]}"
+fi
+for src in "${_snap_srcs[@]}"; do
+    if [[ -n "${fleet_par_out[$src]:-}" ]]; then
+        printf '%s\n' "${fleet_par_out[$src]}" >&2
     fi
+    while read -r verdict arg; do
+        case "$verdict" in
+            ok)          snapdone[$src|$arg]="ok" ;;
+            failed)      snapdone[$src|$arg]="failed" ;;
+            dead-ssh)    dead_src[$src]=1 ;;
+            dead-wedged) dead_src[$src]=1
+                         dead_why[$src]="source wedged (snapshot timeout)"
+                         dead_dest[$src]=1 ;;
+        esac
+    done <<<"${fleet_par_data[$src]:-}"
+    # trees past a host-level death got no verdict: failed
+    for tree in ${_snap_trees[$src]}; do
+        if [[ -z "${snapdone[$src|$tree]:-}" ]]; then
+            snapdone[$src|$tree]="failed"
+        fi
+    done
 done
 for (( i = 0; i < njobs; i++ )); do
     key="${J_SRC[i]}|${J_TREE[i]}"
@@ -455,30 +499,60 @@ for (( i = 0; i < njobs; i++ )); do
         pp_clean[$key]=""
     fi
 done
+# Per-source prune task (fleet_par, §33): a source's trees prune
+# SERIALLY within its task (destroys are sync tasks on that source's
+# pools, and the budget prune measures pool state -- two concurrent
+# prunes on one host would contend and double-count); sources run in
+# parallel, so wall time is the slowest source, not the fleet's sum.
+# Headless: the per-snapshot prune lines print inline (prefixed), so
+# whatever captures the run -- a cron unit's journal, a redirect --
+# has them (replayed per source when its wave slot collects). Live
+# board: the screen stays clean and the lines go nowhere; the result
+# is inspectable on the source itself. STEVEDORE_SHOW_PRUNES=1
+# promotes them to the board runs too.
+_pp_task() {   # $1 = source id
+    local src="$1" i
+    local -a idxs=()
+    read -r -a idxs <<<"${_pp_by_src[$src]}"
+    for i in "${idxs[@]}"; do
+        echo "prune-post: [${J_TREE[i]}] on [${J_SRC[i]}]" >&2
+        if [[ -n "$QUIET" && -z "${STEVEDORE_SHOW_PRUNES:-}" ]]; then
+            ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
+                "sudo -n env STEVEDORE_CONF=${J_RCONF[i]} $STEVE_LIB/stevedore-sendtree.sh --prune-only ${J_TREE[i]}" \
+                </dev/null >/dev/null 2>&1 \
+                || echo "WARNING: prune-post failed for [${J_TREE[i]}] on [${J_SRC[i]}]" >&2
+        else
+            ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
+                "sudo -n env STEVEDORE_CONF=${J_RCONF[i]} bash -c 'source $STEVE_LIB/stevedore-run-indented.sh; run_indented \"[${J_SRC[i]}] \" $STEVE_LIB/stevedore-sendtree.sh --prune-only ${J_TREE[i]}'" \
+                </dev/null \
+                || echo "WARNING: prune-post failed for [${J_TREE[i]}] on [${J_SRC[i]}]" >&2
+        fi
+    done
+    return 0
+}
+
+declare -A _pp_by_src=()
+_pp_srcs=()
 for key in "${pp_keys[@]}"; do
     i=${pp_rep[$key]}
     if [[ -z "${pp_clean[$key]}" ]]; then
         echo "NOTE: not pruning [${J_TREE[i]}] on [${J_SRC[i]}]: not every destination finished clean" >&2
         continue
     fi
-    echo "prune-post: [${J_TREE[i]}] on [${J_SRC[i]}]" >&2
-    # Headless: the per-snapshot prune lines print inline (prefixed), so
-    # whatever captures the run -- a cron unit's journal, a redirect --
-    # has them. Live board: the screen stays clean and the lines go
-    # nowhere; the result is inspectable on the source itself.
-    # STEVEDORE_SHOW_PRUNES=1 promotes them to the board runs too.
-    if [[ -n "$QUIET" && -z "${STEVEDORE_SHOW_PRUNES:-}" ]]; then
-        ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
-            "sudo -n env STEVEDORE_CONF=${J_RCONF[i]} $STEVE_LIB/stevedore-sendtree.sh --prune-only ${J_TREE[i]}" \
-            </dev/null >/dev/null 2>&1 \
-            || echo "WARNING: prune-post failed for [${J_TREE[i]}] on [${J_SRC[i]}]" >&2
-    else
-        ssh "${ssh_opts[@]}" "${J_SSH[i]}" \
-            "sudo -n env STEVEDORE_CONF=${J_RCONF[i]} bash -c 'source $STEVE_LIB/stevedore-run-indented.sh; run_indented \"[${J_SRC[i]}] \" $STEVE_LIB/stevedore-sendtree.sh --prune-only ${J_TREE[i]}'" \
-            </dev/null \
-            || echo "WARNING: prune-post failed for [${J_TREE[i]}] on [${J_SRC[i]}]" >&2
+    src="${J_SRC[i]}"
+    if [[ -z "${_pp_by_src[$src]:-}" ]]; then
+        _pp_srcs+=( "$src" )
     fi
+    _pp_by_src[$src]="${_pp_by_src[$src]:-}${_pp_by_src[$src]:+ }$i"
 done
+if (( ${#_pp_srcs[@]} > 0 )); then
+    fleet_par 16 _pp_task "${_pp_srcs[@]}"
+    for src in "${_pp_srcs[@]}"; do
+        if [[ -n "${fleet_par_out[$src]:-}" ]]; then
+            printf '%s\n' "${fleet_par_out[$src]}" >&2
+        fi
+    done
+fi
 
 #
 # ---------- summary ---------------------------------------------------------------
