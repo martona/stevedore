@@ -108,6 +108,7 @@ declare -A dead_dest=()                  # host wedged as a RECEIVER too (snapsh
                                          # plane, and a dead listener refuses cheaply.)
 pids=()
 logdir=""
+logdir_keep=""                           # nonzero: failing-job logs survive the run
 QUIET=""                                 # live board: defer per-job messages
 
 # One snapshot name for the whole run, every source, every tree -- same
@@ -334,9 +335,15 @@ run_pool() {   # $1 = live | plain
 
     local c_run=$'\e[36m' c_off=$'\e[0m'
     local cols=0 prev_cols=0 remote_cols=0
+    # BOTH modes log: the ledger writer harvests WIRE-BYTES and
+    # FAILED-DATASETS from the per-job logs, and headless runs recorded
+    # bytes:0 forever for want of one (found 2026-08-17, with the
+    # all-success deletion bug below). Live redirects the whole pty
+    # stream; plain mirrors stderr only (WIRE-BYTES etc. ride stderr)
+    # while the console stream flows untouched.
+    logdir=$(mktemp -d /tmp/stevedore-orch.XXXXXX)
     if [[ "$mode" == "live" ]]; then
         QUIET=1
-        logdir=$(mktemp -d /tmp/stevedore-orch.XXXXXX)
         cols=$(tput cols 2>/dev/null) || cols=120
         prev_cols=$cols
         local wire_cols="${STEVEDORE_COLS:-$(( cols < 132 ? cols : 132 ))}"
@@ -375,7 +382,15 @@ run_pool() {   # $1 = live | plain
                     </dev/null >"$(job_log "$i")" 2>&1 &
             else
                 echo "job start: $(job_label "$i")" >&2
-                ssh "${ssh_opts[@]}" "${J_SSH[i]}" "$(job_cmd "$i" "")" </dev/null &
+                # $! must be the ssh, not a pipeline tail: mirror via
+                # process substitutions, never a | tee. BOTH streams:
+                # run_indented merges the job's stderr into its prefixer,
+                # which emits on STDOUT -- a stderr-only mirror logs
+                # nothing (first cut did exactly that, T3 caught it)
+                ssh "${ssh_opts[@]}" "${J_SSH[i]}" "$(job_cmd "$i" "")" \
+                    </dev/null \
+                    > >(tee -a "$(job_log "$i")") \
+                    2> >(tee -a "$(job_log "$i")" >&2) &
             fi
             slot_pid[w]=$!
             slot_job[w]="$i"
@@ -441,9 +456,12 @@ run_pool() {   # $1 = live | plain
                 fi
             done
             echo "Per-job logs kept in: $logdir" >&2
-        else
-            rm -rf -- "$logdir"
+            logdir_keep=1
         fi
+        # NB no rm here even on all-success: the ledger writer still
+        # needs the logs (deleting them here made every clean run record
+        # bytes:0 since the 2.1 harvest landed -- found 2026-08-17).
+        # Cleanup happens after the writer, gated on logdir_keep.
     fi
 }
 
@@ -618,6 +636,11 @@ if [[ -n "$report_dir" ]]; then
             "$report_ts" "$snap" "${J_SRC[i]}" "${J_TREE[i]}" "${J_DST[i]}" \
             "${J_STATE[i]}" "${J_RC[i]:-}" "${J_WHY[i]:-}" "$fdl" "$wbl" "${J_SECS[i]:-0}"
     done >> "$report_dir/runs.jsonl" 2>/dev/null || true
+fi
+# per-job logs served their last reader (the writer above); clean runs
+# drop them here, failing runs keep them for inspection as announced
+if [[ -n "$logdir" && -z "$logdir_keep" ]]; then
+    rm -rf -- "$logdir"
 fi
 
 if [[ ${#hards[@]} -gt 0 || ${#skips[@]} -gt 0 ]]; then

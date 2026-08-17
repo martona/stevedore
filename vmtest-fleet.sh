@@ -22,7 +22,7 @@ DEST2="ztest/recv2/$CN/ztest/src"
 echo "=== setup ==="
 sudo systemctl stop "stevedore-run-*" "stevedore-ha-*" stevedore-test 2>/dev/null
 sudo systemctl reset-failed "stevedore-run-*" "stevedore-ha-*" stevedore-test 2>/dev/null
-rm -rf /tmp/stevedore-fleet.* 2>/dev/null
+rm -rf /tmp/stevedore-fleet.* /tmp/stevedore-orch.* 2>/dev/null
 sleep 0.5
 sudo zpool destroy ztest 2>/dev/null
 sudo rm -rf /dev/zvol/ztest 2>/dev/null
@@ -121,6 +121,14 @@ check "T3 stamp present"       bash -c "[ \"\$(sudo zfs get -H -o value stevedor
 check "T3 second dest arrived" sudo zfs list -H "$DEST2"
 check "T3 second dest stamp"   bash -c "[ \"\$(sudo zfs get -H -o value stevedore:last-recv $DEST2)\" != '-' ]"
 grep -q "0 failed" /tmp/fleet1.log && ok "T3 no failures reported" || { bad "T3 failures"; tail -n 30 /tmp/fleet1.log; }
+# wire bytes must land in the ledger for an ALL-CLEAN HEADLESS run: the
+# two dark corners found 2026-08-17 (headless had no logs to harvest;
+# all-success live runs deleted them before the writer read them)
+RJ="/var/lib/stevedore/runs.jsonl"
+tail -n 10 "$RJ" | grep -qE '"state":"done","rc":"0"[^}]*"bytes":[1-9]' \
+    && ok "T3 wire bytes in ledger (clean headless run)" \
+    || { bad "T3 ledger bytes all zero"; tail -n 4 "$RJ"; }
+check "T3 job logs cleaned after harvest" bash -c "! ls -d /tmp/stevedore-orch.* 2>/dev/null | grep -q ."
 
 echo "=== T4: teardown left nothing behind ==="
 check "T4 run dir removed"     bash -c "! sudo test -e /run/stevedore"
