@@ -1107,6 +1107,15 @@ done
 if (( ${#_gc_wave[@]} > 0 )); then
     fleet_par "gc" 16 _gc_host "${_gc_wave[@]}"
 fi
+# Destroy audit log (owner 2026-09-19): every item gc reclaimed -- and
+# every destroy it attempted and failed -- gets one plain-text line in
+# $STEVE_VAR/gc-destroyed.log, appended HERE, the moment the harvest
+# lands. The jsonl gc array carries the same lines, but only inside the
+# run record written at the very end, and only when that record is
+# written at all (space-accounting gate; seal_ledger writes gc:[]). A
+# destroy is the one irreversible thing this tool does; its record must
+# not depend on the rest of the run going well.
+report_dir_resolve
 for h in "${_gc_wave[@]}"; do
     echo "gc: [$h]" >&2
     if [[ -n "${fleet_par_data[$h]:-}" ]]; then
@@ -1131,6 +1140,13 @@ for h in "${_gc_wave[@]}"; do
             fi
             if [[ -z "$gl" ]]; then
                 continue
+            fi
+            # the audit log takes the say-line verbatim (receiver-side
+            # names, no escaping -- it is for eyes, not parsers)
+            if [[ -n "$report_dir" ]] \
+                && [[ "$gl" == *": DESTROYED"* || "$gl" == *": WARNING -- destroy failed"* ]]; then
+                printf '%s run=%s [%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$run_id" "$h" "$gl" \
+                    >> "$report_dir/gc-destroyed.log" 2>/dev/null || true
             fi
             # receiver-side dataset names were never charset-validated
             # (foreign junk is exactly what GC reports on) -- escape

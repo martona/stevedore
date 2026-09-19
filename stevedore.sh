@@ -430,7 +430,9 @@ fleet.conf [options] gc-destroy on
                               reclaimed at the post-run GC pass
 
 Internals live in $STEVE_LIB (debug invocation = full path).
-Ledger: $STEVE_VAR/runs.jsonl.
+Ledger: $STEVE_VAR/runs.jsonl. Destroy audit: $STEVE_VAR/gc-destroyed.log
+(one line per item GC reclaimed or failed to reclaim; grows only under
+gc-destroy on).
 EOF
 }
 

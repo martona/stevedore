@@ -511,6 +511,8 @@ sudo zfs create "ztest/recv/$CN/doomed2"
 sudo zfs snapshot "ztest/recv/$CN/doomed2@junk"
 sudo zfs set stevedore:orphan-since=2026-01-01T00:00:00Z "ztest/recv/$CN/doomed2"
 sed '/^port/a gc-destroy   on' ~/fleet-test.conf > ~/fleet-gcd.conf
+GDL="/var/lib/stevedore/gc-destroyed.log"
+rm -f "$GDL"   # audit log persists across suite runs; count from zero
 STEVEDORE_GC_WARN_DAYS=0 STEVEDORE_GC_GRACE_DAYS=0 /usr/local/lib/stevedore/stevedore-fleetrun.sh -c ~/fleet-gcd.conf >/tmp/fleet19.log 2>&1
 rc=$?
 check "T20 gc-destroy run rc=0" test "$rc" -eq 0
@@ -518,6 +520,15 @@ grep -q "gc: destroy flag is ON" /tmp/fleet19.log && ok "T20 run announces the a
 check "T20 doomed2 reclaimed by the run" bash -c "! sudo zfs list -H ztest/recv/$CN/doomed2 2>/dev/null"
 grep -q "doomed2: DESTROYED" /tmp/fleet19.log && ok "T20 destroy in run output" || { bad "T20 run output"; grep -a DESTROY /tmp/fleet19.log | head -3; }
 grep -qF 'DESTROYED' "$RJ" && ok "T20 destroys ride the jsonl gc harvest" || { bad "T20 jsonl"; tail -n 1 "$RJ"; }
+# the destroy audit log on the orchestrator: one line per reclaimed item,
+# stamped with the run id and the receiver; the direct gc.sh invocations
+# above ran outside a run and must not appear in it
+check "T20 audit log written" test -s "$GDL"
+gcrun=$(grep -o 'run-[0-9]*-[0-9]*' /tmp/fleet19.log | head -n 1)
+grep -qE "^20[0-9]{2}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z run=$gcrun \[vmrecv\] ztest/recv/$CN/doomed2: DESTROYED \(-r\) -- orphan-since 2026-01-01T00:00:00Z" "$GDL" \
+    && ok "T20 audit line names run, receiver, item" || { bad "T20 audit line"; cat "$GDL"; }
+check "T20 audit log holds only the run's destroys" test "$(wc -l < "$GDL")" -eq 1
+grep -q "doomed/child\|agedforeign" "$GDL" && { bad "T20 audit log has out-of-run destroys"; cat "$GDL"; } || ok "T20 direct gc.sh destroys stay out of the audit log"
 
 echo "=== T21: sender snaps= budget: tighter-of wins, floor holds ==="
 # (a) end-to-end: a [source-quota] row (3M) must reach the sender bundle
