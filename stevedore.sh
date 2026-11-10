@@ -75,9 +75,6 @@ do_install() {
 
     u=$(orch_user)
     mkdir -p "$STEVE_ETC"
-    if [[ ! -f "$STEVE_ETC/stevedore.conf" && -f "$STEVE_HERE/stevedore.conf" ]]; then
-        cp "$STEVE_HERE/stevedore.conf" "$STEVE_ETC/stevedore.conf"
-    fi
     # the config belongs to the operator, same doctrine as the ledger:
     # on a one-operator estate the orchestrator's identity IS the
     # operator, and editing fleet.conf (steve jobs, or a plain editor)
@@ -102,7 +99,10 @@ do_install() {
     chown "$u" "$STEVE_VAR/runs.jsonl"
 
     echo "stevedore installed: $STEVE_LIB (steve -> $STEVE_BIN, ledger $STEVE_VAR/runs.jsonl owned by $u)" >&2
-    echo "config dir: $STEVE_ETC (fleet.conf drives runs; stevedore.conf is per-host settings)" >&2
+    echo "config dir: $STEVE_ETC (fleet.conf drives runs; per-host settings are generated per run)" >&2
+    if [[ -f "$STEVE_ETC/stevedore.conf" ]]; then
+        echo "note: $STEVE_ETC/stevedore.conf is obsolete (nothing reads it); safe to delete" >&2
+    fi
 }
 
 do_uninstall() {
@@ -153,12 +153,12 @@ do_check() {
     else
         warn "no $STEVE_ETC/fleet.conf (not an orchestrator box, or not configured yet)"
     fi
+    # The static per-host config died with T/F: every run reads a
+    # fleetrun-generated run.conf (STEVEDORE_CONF), and no perma-certs
+    # exist for a manual listener to use. A leftover is harmless but
+    # misleading -- its sections describe a retired layout.
     if [[ -f "$STEVE_ETC/stevedore.conf" ]]; then
-        if (bash -c "set -u; STEVEDORE_CONF='$STEVE_ETC/stevedore.conf' source '$STEVE_HERE/stevedore-cfgparser.sh'") >/dev/null 2>&1; then
-            ok "stevedore.conf parses"
-        else
-            fail "stevedore.conf does not parse"
-        fi
+        warn "$STEVE_ETC/stevedore.conf is obsolete (nothing reads it; run configs are generated per run) -- safe to delete"
     fi
 
     # ledger

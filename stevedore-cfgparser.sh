@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# Parse /etc/stevedore/stevedore.conf and leave:
+# Parse a stevedore run config and leave the variables below. In every
+# real run STEVEDORE_CONF names a fleetrun-generated file (per-host
+# run.conf, or the orchestrator.conf); the $STEVE_ETC/stevedore.conf
+# default only serves hand-driven debugging and the protocol VM suite
+# -- no static config ships or is installed. cert_dir's default doubles
+# as the "not a run config" sentinel (recv.sh compares against it).
 #   * recv_root      (string)
 #   * tcp_port       (string)
 #   * tcp_addr       (string)
 #   * keep_count     (string, numeric)
+#   * cert_dir       (string)
 #   * allowed_hosts  (bash array)
-#   * sends          (bash array)
 #   * prune_prefixes (bash array)
-#   * orchtargets    (bash array)
 #   * orchjobs       (bash array)
 #   * orchworkers    (string, numeric)
-#   * orchec2up      (bash array)
 #   * transport      (string: socat | haproxy)
 #   * tunnels        (bash array: "dial localport" rows, haproxy senders)
 #   * retain_spec    (string: retention grid, e.g. "hourly=48 daily=30")
@@ -26,7 +29,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/stevedore-paths.sh"
 CFG="${STEVEDORE_CONF:-$STEVE_ETC/stevedore.conf}"
 
 recv_root="" tcp_port="" tcp_addr="" keep_count="" cert_dir="" allowed_hosts=()
-sends=() prune_prefixes=() orchtargets=() orchjobs=() orchec2up=() orchworkers=""
+prune_prefixes=() orchjobs=() orchworkers=""
 transport="" tunnels=() retain_spec="" snapsbudget=() exclusions=()
 
 current=""
@@ -47,9 +50,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         keep-count)            keep_count="$line" ;;
         cert-dir)              cert_dir="$line" ;;
         allowed_hosts)         allowed_hosts+=( "$line" ) ;;
-        sends)                 sends+=( "$line" ) ;;
         prune-prefixes)        prune_prefixes+=( "$line" ) ;;
-        orchestrator-targets)  orchtargets+=( "$line" ) ;;
         orchestrator-jobs)     orchjobs+=( "$line" ) ;;
         orchestrator-workers)  orchworkers="$line" ;;
         transport)             transport="$line" ;;
@@ -57,7 +58,6 @@ while IFS= read -r line || [[ -n "$line" ]]; do
         retain)                retain_spec="$line" ;;
         snaps-budget)          snapsbudget+=( "$line" ) ;;
         exclusions)            exclusions+=( "$line" ) ;;
-        orchestrator-ec2up)    orchec2up+=( "$line" ) ;;
     esac
 done < "$CFG"
 

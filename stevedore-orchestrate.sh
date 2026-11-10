@@ -79,11 +79,6 @@ for entry in "${orchjobs[@]}"; do
 done
 njobs=${#J_SRC[@]}
 if (( njobs == 0 )); then
-    if [[ ${#orchtargets[@]} -gt 0 ]]; then
-        echo "ERROR: [orchestrator-targets] host mode was retired by T (PROTOCOL.md §19);" >&2
-        echo "       run through fleetrun.sh, which generates [orchestrator-jobs]." >&2
-        exit 78
-    fi
     echo "No jobs in [orchestrator-jobs]; nothing to do." >&2
     exit 0
 fi

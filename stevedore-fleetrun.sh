@@ -26,8 +26,9 @@
 #   7. tears everything down: listeners stopped, /run/stevedore removed,
 #      local run dir (including the CA key) deleted unless --keep.
 #
-# Each host's own /etc/stevedore/stevedore.conf is never touched; manual
-# stevedore-send.sh runs keep working throughout.
+# There is no static per-host config: every participant reads only the
+# run.conf in its bundle (and the orchestrator its generated
+# orchestrator.conf); fleet.conf is the single source of settings.
 #
 # Exit: orchestrate's exit code (0/1/2), or 78 config, 75 busy, 1 provisioning.
 

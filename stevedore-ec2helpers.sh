@@ -18,6 +18,12 @@
 # come through. Host authenticity is treated as a property of the
 # LAN/tailnet; the data path authenticates itself with mTLS either way.
 source "$(dirname "${BASH_SOURCE[0]}")/stevedore-paths.sh"
+
+# EC2 instance ids to wake. fleetrun fills this from fleet.conf ec2= after
+# sourcing; everywhere else (orchestrate.sh, a fleetrun child) it stays
+# empty, so ec2_maybe_start is a no-op there.
+orchec2up=()
+
 ssh_opts=( -o ConnectTimeout=10 -o BatchMode=yes
            -o StrictHostKeyChecking=no
            -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null
@@ -85,7 +91,7 @@ ec2_maybe_start() {
     [[ ${#orchec2up[@]} -gt 0 ]] || return 0
 
     if ! command -v aws &>/dev/null; then
-        echo "ERROR: AWS CLI is not installed, but orchestrator-ec2up section is present in the config." >&2
+        echo "ERROR: AWS CLI is not installed, but this run has ec2= hosts to wake (fleet.conf)." >&2
         exit 1
     fi
     if ! aws ec2 describe-instances > /dev/null 2>&1; then
