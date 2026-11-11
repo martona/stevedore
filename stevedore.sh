@@ -212,7 +212,7 @@ do_check() {
             local rest rroot probe_rroots=()
             while read -r h dest rroot rest; do
                 [[ -n "$h" ]] || continue
-                ssh "${ssh_opts[@]}" "$dest" true </dev/null >/dev/null 2>&1 &
+                timeout -k 5 "$probe_timeout" ssh "${ssh_opts[@]}" "$dest" true </dev/null >/dev/null 2>&1 &
                 probe_pids+=( $! )
                 probe_hosts+=( "$h" )
                 probe_dests+=( "$dest" )
@@ -227,10 +227,13 @@ do_check() {
             else
                 warn "unreachable participants (offline or EC2 asleep is normal): ${unreach[*]}"
             fi
-            local deep clean=0 line
+            local deep drc clean=0 line
             for (( i = 0; i < ${#probe_hosts[@]}; i++ )); do
                 [[ " ${unreach[*]:-} " == *" ${probe_hosts[i]} "* ]] && continue
-                deep=$(ssh "${ssh_opts[@]}" "${probe_dests[i]}" "
+                # bounded too: zfs on a suspended pool (failmode=wait)
+                # blocks forever, and the doctor must still finish
+                drc=0
+                deep=$(timeout -k 5 120 ssh "${ssh_opts[@]}" "${probe_dests[i]}" "
                     m=''
                     sudo -n true 2>/dev/null || echo 'HARD passwordless sudo missing'
                     for b in $deps; do command -v \$b >/dev/null || m=\"\$m \$b\"; done
@@ -252,7 +255,12 @@ do_check() {
                             [ \$? -eq 124 ] && echo \"SOFT no route to \$n:\$p (connect timeout)\"
                         fi
                     done
-                    true" </dev/null 2>/dev/null) || deep="HARD deep probe died mid-check"
+                    true" </dev/null 2>/dev/null) || drc=$?
+                if (( drc == 124 || drc == 137 )); then
+                    deep="HARD deep probe timed out after 120s (wedged pool? hung zfs or sudo?)"
+                elif (( drc != 0 )); then
+                    deep="HARD deep probe died mid-check"
+                fi
                 if [[ -z "$deep" ]]; then
                     clean=$(( clean + 1 ))
                 else
@@ -420,6 +428,8 @@ steve -- fleet ZFS replication (stevedore)
 
 Knobs (env, on the steve run command line):
   STEVEDORE_SHOW_PRUNES=1      name every snapshot destroyed by the run
+  STEVEDORE_PROBE_TIMEOUT=     reachability-probe deadline, seconds
+                              (default 30; also used by steve check)
   STEVEDORE_GC_WARN_DAYS= / STEVEDORE_GC_GRACE_DAYS=
                               GC thresholds, forwarded to receivers
                               (0 is safe while gc-destroy is off)

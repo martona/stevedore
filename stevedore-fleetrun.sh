@@ -261,20 +261,35 @@ if [[ -n "$has_cadence" && -z "$force_ec2" ]]; then
             fi
         fi
     done
+    # Announced before the fan-out: this is the only wait between launch
+    # and "fleet plan", so a stall here must not look like total silence
+    # (the 2026-11-10 rapids hang). Each probe is bounded by
+    # $probe_timeout (ec2helpers); expiry = unreachable.
     probe_pids=(); probe_hosts=()
     for h in "${fleet_sources[@]}"; do
         if [[ -n "${probe_set[$h]:-}" ]]; then
-            fleet_ssh "$(fleet_ssh_dest "$h")" true </dev/null >/dev/null 2>&1 &
-            probe_pids+=( $! )
             probe_hosts+=( "$h" )
         fi
+    done
+    if (( ${#probe_hosts[@]} > 0 )); then
+        echo "cadence: probing ${#probe_hosts[@]} source(s) (${probe_timeout}s deadline): ${probe_hosts[*]}" >&2
+    fi
+    for h in "${probe_hosts[@]}"; do
+        timeout -k 5 "$probe_timeout" ssh "${ssh_opts[@]}" "$(fleet_ssh_dest "$h")" true \
+            </dev/null >/dev/null 2>&1 &
+        probe_pids+=( $! )
     done
     for (( i = 0; i < ${#probe_pids[@]}; i++ )); do
         if wait "${probe_pids[i]}"; then
             src_reach[${probe_hosts[i]}]=1
         else
+            prc=$?
             probe_dead[${probe_hosts[i]}]=1
-            echo "cadence: source [${probe_hosts[i]}] unreachable; its jobs to cadence destinations skip this run" >&2
+            if (( prc == 124 || prc == 137 )); then
+                echo "cadence: source [${probe_hosts[i]}] probe timed out after ${probe_timeout}s (connected, then stalled); its jobs to cadence destinations skip this run" >&2
+            else
+                echo "cadence: source [${probe_hosts[i]}] unreachable; its jobs to cadence destinations skip this run" >&2
+            fi
         fi
     done
     _pre_recv=( "${fleet_receivers[@]}" )

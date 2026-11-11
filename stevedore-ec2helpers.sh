@@ -29,6 +29,14 @@ ssh_opts=( -o ConnectTimeout=10 -o BatchMode=yes
            -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null
            -o LogLevel=ERROR )
 
+# Reachability probes (`ssh host true`) get a hard deadline. ConnectTimeout
+# bounds only the connect; a host that accepts and then stalls (wedged
+# sshd, PAM/logind, a Tailscale SSH check prompt that BatchMode can never
+# answer) would otherwise hold the probe -- and the whole run behind it --
+# forever, with no output. Expiry (rc 124, or 137 after the -k grace)
+# counts as unreachable, same as an ssh 255.
+probe_timeout="${STEVEDORE_PROBE_TIMEOUT:-30}"
+
 # Take the lock shared by orchestrate.sh and deploy.sh: swapping scripts
 # under a run in flight would mix script generations within one run, so the
 # two exclude each other. The file is chmod 666 so root-run and user-run

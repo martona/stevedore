@@ -392,6 +392,26 @@ grep -qF '"src":"nosuchsrc","tree":"ztest/src","dst":"vmrecv2","state":"cadence"
 /usr/local/lib/stevedore/stevedore-report.sh 2>/dev/null | grep -q "1 within cadence, 1 source offline" && ok "T17 report splits offline from cadence" || { bad "T17 offline tally"; /usr/local/lib/stevedore/stevedore-report.sh 2>&1 | head -n 8; }
 grep -q "0 failed" /tmp/fleet15.log && ok "T17 offline-source run clean" || { bad "T17 offline failures"; tail -n 20 /tmp/fleet15.log; }
 
+# a source that STALLS instead of refusing (the 2026-11-10 rapids hang
+# shape): ProxyCommand sleep never yields a banner. The probe deadline
+# (3s here, well under ConnectTimeout's 10) must end it, announce it as
+# a timeout, and treat the host exactly like an offline one.
+if ! grep -q '^Host stevedore-stall.invalid' ~/.ssh/config 2>/dev/null; then
+    printf '\nHost stevedore-stall.invalid\n    ProxyCommand sleep 600\n' >> ~/.ssh/config
+fi
+cp ~/fleet-cad.conf ~/fleet-cad4.conf
+printf '[hosts]\nstallsrc ssh=nobody@stevedore-stall.invalid\n[jobs]\nstallsrc ztest/src vmrecv2\n' >> ~/fleet-cad4.conf
+t0=$(date +%s)
+STEVEDORE_PROBE_TIMEOUT=3 /usr/local/lib/stevedore/stevedore-fleetrun.sh -c ~/fleet-cad4.conf >/tmp/fleet16.log 2>&1
+rc=$?
+t1=$(date +%s)
+check "T17 stalled-source rc=0" test "$rc" -eq 0
+grep -q "cadence: probing 1 source(s) (3s deadline): stallsrc" /tmp/fleet16.log && ok "T17 probe fan-out announced" || { bad "T17 probe announce"; grep -a "cadence" /tmp/fleet16.log; }
+grep -q "cadence: source \[stallsrc\] probe timed out after 3s" /tmp/fleet16.log && ok "T17 stalled source times out" || { bad "T17 stall timeout"; grep -a "cadence" /tmp/fleet16.log; }
+check "T17 stalled-source run finishes promptly" test $(( t1 - t0 )) -lt 30
+grep -q "starting run listener on \[vmrecv2\]" /tmp/fleet16.log && bad "T17 stalled-source dest still provisioned" || ok "T17 stalled-source dest stays asleep"
+pkill -u "$(id -un)" -f '^sleep 600$' 2>/dev/null || true
+
 # age the whole ledger out of the window (ISO ts compares as a string;
 # 19xx loses to any cutoff): everything runs again
 sed -i 's/"ts":"20/"ts":"19/g' "$RJ"
